@@ -1,0 +1,161 @@
+#include <Servo.h>
+#include <string.h>
+
+// ===== Pins (UNO) =====
+static const uint8_t SERVO1_PIN = 3;   // Pouch1
+static const uint8_t SERVO2_PIN = 5;   // Pouch2
+static const uint8_t SERVO3_PIN = 6;   // Pouch3
+static const uint8_t SERVO4_PIN = 9;   // Pouch4
+static const uint8_t SERVO5_PIN = 10;  // Propulsion
+static const uint8_t SERVO6_PIN = 11;  // Gripper
+
+// ===== Pulse window (µs) =====
+static int US_MIN = 600;
+static int US_MAX = 2400;
+
+// ===== Motion tuning =====
+static unsigned long MOVE_INTERVAL_MS = 10; // update interval
+static int STEP_DEG = 3;                    // degrees per tick toward target
+
+static inline int clampi(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+int angleToPulse(int angle) {
+  angle = clampi(angle, 0, 270);
+  return map(angle, 0, 270, US_MIN, US_MAX);
+}
+
+int stepTowardBy(int current, int target, int step) {
+  if (current < target) return min(current + step, target);
+  if (current > target) return max(current - step, target);
+  return current;
+}
+
+// Servos
+Servo s1, s2, s3, s4, s5, s6;
+
+// Current + target
+int pos1=150, pos2=150, pos3=150, pos4=150, pos5=150, pos6=150;
+int tgt1=150, tgt2=150, tgt3=150, tgt4=150, tgt5=150, tgt6=150;
+
+// Non-blocking serial line parser
+static const size_t CMD_BUF_SZ = 96;
+char cmd_buf[CMD_BUF_SZ];
+size_t cmd_len = 0;
+
+void writeNow(Servo &sv, int angle) {
+  sv.writeMicroseconds(angleToPulse(angle));
+}
+
+void processLine(const char* line) {
+  // trim leading spaces
+  while (*line == ' ' || *line == '\t') ++line;
+
+  // trim trailing CR/spaces
+  size_t L = strlen(line);
+  while (L && (line[L-1] == '\r' || line[L-1] == ' ' || line[L-1] == '\t')) --L;
+
+  char s[CMD_BUF_SZ];
+  L = min(L, CMD_BUF_SZ - 1);
+  memcpy(s, line, L);
+  s[L] = '\0';
+
+  // SET:a1,a2,a3,a4,a5,a6  (angles 0..270)
+  if (strncmp(s, "SET:", 4) == 0) {
+    int a1,a2,a3,a4,a5,a6;
+    if (sscanf(s+4, "%d,%d,%d,%d,%d,%d", &a1,&a2,&a3,&a4,&a5,&a6) == 6) {
+      tgt1 = clampi(a1, 0, 270);
+      tgt2 = clampi(a2, 0, 270);
+      tgt3 = clampi(a3, 0, 270);
+      tgt4 = clampi(a4, 0, 270);
+      tgt5 = clampi(a5, 0, 270);
+      tgt6 = clampi(a6, 0, 270);
+    }
+    return;
+  }
+
+  // Optional: HALT:n (freeze at current pos)
+  if (strncmp(s, "HALT:", 5) == 0) {
+    int idx = 0;
+    if (sscanf(s+5, "%d", &idx) == 1) {
+      switch (idx) {
+        case 1: tgt1 = pos1; break;
+        case 2: tgt2 = pos2; break;
+        case 3: tgt3 = pos3; break;
+        case 4: tgt4 = pos4; break;
+        case 5: tgt5 = pos5; break;
+        case 6: tgt6 = pos6; break;
+        default: break;
+      }
+    }
+    return;
+  }
+
+  // Optional: SPD:step,interval_ms
+  if (strncmp(s, "SPD:", 4) == 0) {
+    int step, interval;
+    if (sscanf(s+4, "%d,%d", &step, &interval) == 2) {
+      STEP_DEG = clampi(step, 1, 30);
+      MOVE_INTERVAL_MS = (unsigned long)clampi(interval, 1, 100);
+    }
+    return;
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  Serial.setTimeout(1);
+
+  s1.attach(SERVO1_PIN, US_MIN, US_MAX);
+  s2.attach(SERVO2_PIN, US_MIN, US_MAX);
+  s3.attach(SERVO3_PIN, US_MIN, US_MAX);
+  s4.attach(SERVO4_PIN, US_MIN, US_MAX);
+  s5.attach(SERVO5_PIN, US_MIN, US_MAX);
+  s6.attach(SERVO6_PIN, US_MIN, US_MAX);
+
+  writeNow(s1, pos1); writeNow(s2, pos2); writeNow(s3, pos3);
+  writeNow(s4, pos4); writeNow(s5, pos5); writeNow(s6, pos6);
+
+  Serial.println("Servo6 READY");
+  Serial.println("Commands:");
+  Serial.println("  SET:a1,a2,a3,a4,a5,a6");
+  Serial.println("  HALT:n (1..6)  | SPD:step,interval_ms");
+}
+
+void loop() {
+  // 1) Read serial (non-blocking)
+  while (Serial.available()) {
+    int c = Serial.read();
+    if (c < 0) break;
+    if (c == '\r') continue;
+    if (c == '\n') {
+      if (cmd_len > 0) {
+        cmd_buf[cmd_len] = '\0';
+        processLine(cmd_buf);
+        cmd_len = 0;
+      }
+    } else {
+      if (cmd_len < CMD_BUF_SZ - 1) cmd_buf[cmd_len++] = (char)c;
+    }
+  }
+
+  // 2) Step toward targets
+  static unsigned long lastMove = 0;
+  const unsigned long now = millis();
+  if (now - lastMove >= MOVE_INTERVAL_MS) {
+    lastMove = now;
+
+    int n1 = stepTowardBy(pos1, tgt1, STEP_DEG);
+    int n2 = stepTowardBy(pos2, tgt2, STEP_DEG);
+    int n3 = stepTowardBy(pos3, tgt3, STEP_DEG);
+    int n4 = stepTowardBy(pos4, tgt4, STEP_DEG);
+    int n5 = stepTowardBy(pos5, tgt5, STEP_DEG);
+    int n6 = stepTowardBy(pos6, tgt6, STEP_DEG);
+
+    if (n1 != pos1) { pos1 = n1; writeNow(s1, pos1); }
+    if (n2 != pos2) { pos2 = n2; writeNow(s2, pos2); }
+    if (n3 != pos3) { pos3 = n3; writeNow(s3, pos3); }
+    if (n4 != pos4) { pos4 = n4; writeNow(s4, pos4); }
+    if (n5 != pos5) { pos5 = n5; writeNow(s5, pos5); }
+    if (n6 != pos6) { pos6 = n6; writeNow(s6, pos6); }
+  }
+}
