@@ -1,0 +1,180 @@
+#include <AccelStepper.h>
+
+// ===================== Pins =====================
+static const uint8_t EN_PIN = 8;   // active-low enable on most DRV8825 carriers
+
+static const uint8_t STEP1 = 3;
+static const uint8_t DIR1  = 2;
+
+static const uint8_t STEP2 = 5;
+static const uint8_t DIR2  = 4;
+
+static const uint8_t STEP3 = 7;
+static const uint8_t DIR3  = 6;
+
+// Stepper 4 pins (your current)
+static const uint8_t STEP4 = 9;
+static const uint8_t DIR4  = 12;
+
+// ===================== Steppers =====================
+AccelStepper s1(AccelStepper::DRIVER, STEP1, DIR1);
+AccelStepper s2(AccelStepper::DRIVER, STEP2, DIR2);
+AccelStepper s3(AccelStepper::DRIVER, STEP3, DIR3);
+AccelStepper s4(AccelStepper::DRIVER, STEP4, DIR4);
+
+// ===================== Enable helper =====================
+static inline void set_enable(bool en) {
+  digitalWrite(EN_PIN, en ? LOW : HIGH);  // LOW = enabled
+}
+
+// ===================== Serial line buffer =====================
+static const size_t CMD_BUF_SZ = 96;
+static char   cmd_buf[CMD_BUF_SZ];
+static size_t cmd_len = 0;
+
+// ===================== Safety / watchdog =====================
+static unsigned long last_cmd_ms = 0;
+static const unsigned long CMD_TIMEOUT_MS = 250;   // stop if no valid command in 0.25s
+static bool drivers_enabled = false;
+
+// Tune motion here
+static const float MAX_SPEED = 800.0f;  // steps/s
+static const float ACCEL     = 400.0f;  // steps/s^2
+
+// Optional: stop motors + disable drivers on comms timeout
+static const bool DISABLE_ON_TIMEOUT = false;
+
+// ===================== Command handling =====================
+void handle_line(const char* line_in) {
+  // Trim leading spaces
+  while (*line_in == ' ' || *line_in == '\t') ++line_in;
+  if (*line_in == '\0') return;
+
+  // Enable/disable commands (optional)
+  if (strcmp(line_in, "EN 1") == 0) {
+    set_enable(true);
+    drivers_enabled = true;
+    Serial.println("ENABLED");
+    return;
+  }
+  if (strcmp(line_in, "EN 0") == 0) {
+    set_enable(false);
+    drivers_enabled = false;
+    Serial.println("DISABLED");
+    return;
+  }
+
+  // Main command: P t1 t2 t3 t4
+  long t1, t2, t3, t4;
+  if (sscanf(line_in, "P %ld %ld %ld %ld", &t1, &t2, &t3, &t4) == 4) {
+    // First valid command: enable drivers (prevents boot drift)
+    if (!drivers_enabled) {
+      set_enable(true);
+      drivers_enabled = true;
+      Serial.println("AUTO-EN");
+    }
+
+    last_cmd_ms = millis();
+
+    s1.moveTo(t1);
+    s2.moveTo(t2);
+    s3.moveTo(t3);
+    s4.moveTo(t4);
+
+    // Optional debug:
+    // Serial.print("GOT: "); Serial.println(line_in);
+    return;
+  }
+
+  // Unknown command -> ignore silently (keeps loop fast)
+}
+
+// ===================== Setup =====================
+void setup() {
+  // Make STEP/DIR outputs immediately to reduce floating/noise
+  pinMode(STEP1, OUTPUT); pinMode(DIR1, OUTPUT);
+  pinMode(STEP2, OUTPUT); pinMode(DIR2, OUTPUT);
+  pinMode(STEP3, OUTPUT); pinMode(DIR3, OUTPUT);
+  pinMode(STEP4, OUTPUT); pinMode(DIR4, OUTPUT);
+
+  // IMPORTANT: disable drivers at boot (prevents runaways during reset)
+  pinMode(EN_PIN, OUTPUT);
+  set_enable(false);
+  drivers_enabled = false;
+
+  // Serial
+  Serial.begin(115200);
+  // NOTE: no readStringUntil, so timeout doesn’t matter anymore
+  Serial.setTimeout(1);
+
+  // Configure steppers
+  s1.setMaxSpeed(MAX_SPEED); s1.setAcceleration(ACCEL);
+  s2.setMaxSpeed(MAX_SPEED); s2.setAcceleration(ACCEL);
+  s3.setMaxSpeed(MAX_SPEED); s3.setAcceleration(ACCEL);
+  s4.setMaxSpeed(MAX_SPEED); s4.setAcceleration(ACCEL);
+
+  s1.setCurrentPosition(0);
+  s2.setCurrentPosition(0);
+  s3.setCurrentPosition(0);
+  s4.setCurrentPosition(0);
+
+  last_cmd_ms = millis();
+
+  Serial.println("READY (drivers disabled until first P...)");
+}
+
+// ===================== Loop =====================
+void loop() {
+  // ---- 1) Read all available serial bytes (non-blocking) ----
+  while (Serial.available() > 0) {
+    int c = Serial.read();
+    if (c < 0) break;
+
+    if (c == '\r') continue;
+
+    if (c == '\n') {
+      // End of line
+      if (cmd_len > 0) {
+        cmd_buf[cmd_len] = '\0';
+        handle_line(cmd_buf);
+        cmd_len = 0;
+      }
+    } else {
+      // Accumulate
+      if (cmd_len < CMD_BUF_SZ - 1) {
+        cmd_buf[cmd_len++] = (char)c;
+      } else {
+        // Overflow -> reset buffer (avoid stuck state)
+        cmd_len = 0;
+      }
+    }
+  }
+
+  // ---- 2) Watchdog: if comms stop, stop motion ----
+  if (drivers_enabled && (millis() - last_cmd_ms > CMD_TIMEOUT_MS)) {
+    // stop() decelerates; you can also force immediate by moveTo(currentPosition)
+    s1.stop(); s2.stop(); s3.stop(); s4.stop();
+
+    // Optionally hard-freeze positions immediately:
+    // s1.moveTo(s1.currentPosition());
+    // s2.moveTo(s2.currentPosition());
+    // s3.moveTo(s3.currentPosition());
+    // s4.moveTo(s4.currentPosition());
+
+    if (DISABLE_ON_TIMEOUT) {
+      set_enable(false);
+      drivers_enabled = false;
+      Serial.println("TIMEOUT -> DISABLE");
+    } else {
+      // Keep enabled but stopped; update last_cmd_ms so we don't spam stops
+      last_cmd_ms = millis();
+      // Serial.println("TIMEOUT -> STOP");
+    }
+  }
+
+  // ---- 3) Step motors ----
+  s1.run();
+  s2.run();
+  s3.run();
+  s4.run();
+}
