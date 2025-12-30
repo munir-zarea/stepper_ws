@@ -1,180 +1,407 @@
-#include <AccelStepper.h>
+// stepper_joy_node.cpp
+// ROS2 C++ node: 3-tendon continuum "directional move + hold" with
+// - Choice 2 slack allowance (min clamp below home)
+// - Per-motor max clamp
+// - "Back to home" button
+// - Stepper4 button control + optional home
+//
+// Serial protocol (Arduino): "P t1 t2 t3 t4\n" and optional "EN 1\n"
+//
+// Build: put in your package src/, add to CMakeLists as executable, etc.
 
-// ===================== Pins =====================
-static const uint8_t EN_PIN = 8;   // active-low enable on most DRV8825 carriers
+#include <rclcpp/rclcpp.hpp>
+#include <sensor_msgs/msg/joy.hpp>
 
-static const uint8_t STEP1 = 3;
-static const uint8_t DIR1  = 2;
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <limits>
+#include <string>
 
-static const uint8_t STEP2 = 5;
-static const uint8_t DIR2  = 4;
+#include <fcntl.h>
+#include <termios.h>
+#include <unistd.h>
 
-static const uint8_t STEP3 = 7;
-static const uint8_t DIR3  = 6;
+#include <cerrno>
+#include <cstring>
 
-// Stepper 4 pins (your current)
-static const uint8_t STEP4 = 9;
-static const uint8_t DIR4  = 12;
+class StepperJoy : public rclcpp::Node {
+public:
+  StepperJoy() : Node("stepper_joy_node") {
+    // ---------------- Joystick ----------------
+    axis_x_   = declare_parameter<int>("axis_x", 0);
+    axis_y_   = declare_parameter<int>("axis_y", 1);
+    deadband_ = declare_parameter<double>("deadband", 0.20);
+    invert_y_ = declare_parameter<bool>("invert_y", true);
 
-// ===================== Steppers =====================
-AccelStepper s1(AccelStepper::DRIVER, STEP1, DIR1);
-AccelStepper s2(AccelStepper::DRIVER, STEP2, DIR2);
-AccelStepper s3(AccelStepper::DRIVER, STEP3, DIR3);
-AccelStepper s4(AccelStepper::DRIVER, STEP4, DIR4);
+    // "Direction you point" alignment
+    theta_offset_deg_ = declare_parameter<double>("theta_offset_deg", 0.0);
+    invert_theta_     = declare_parameter<bool>("invert_theta", false);
 
-// ===================== Enable helper =====================
-static inline void set_enable(bool en) {
-  digitalWrite(EN_PIN, en ? LOW : HIGH);  // LOW = enabled
-}
+    // Button: go back to neutral / home
+    // Xbox typical: A=0, B=1, X=2, Y=3, LB=4, RB=5
+    btn_home_         = declare_parameter<int>("btn_home", 3);  // default Y
+    home_step4_too_   = declare_parameter<bool>("home_step4_too", false);
 
-// ===================== Serial line buffer =====================
-static const size_t CMD_BUF_SZ = 96;
-static char   cmd_buf[CMD_BUF_SZ];
-static size_t cmd_len = 0;
+    // Optional: require a "deadman" button to allow motion (safer)
+    // If enabled and not pressed, node holds current targets.
+    use_deadman_      = declare_parameter<bool>("use_deadman", false);
+    btn_deadman_      = declare_parameter<int>("btn_deadman", 0); // default A
 
-// ===================== Safety / watchdog =====================
-static unsigned long last_cmd_ms = 0;
-static const unsigned long CMD_TIMEOUT_MS = 250;   // stop if no valid command in 0.25s
-static bool drivers_enabled = false;
+    // ---------------- Speed / feel (SLOW) ----------------
+    // At full stick, each motor gets about max_steps_per_tick * cos(...)
+    // With 60 Hz:
+    //   1 step/tick ~ 60 steps/s  (very slow)
+    //   2 step/tick ~ 120 steps/s
+    //   4 step/tick ~ 240 steps/s
+    max_steps_per_tick_ = declare_parameter<double>("max_steps_per_tick", 1.0);
+    update_rate_hz_     = declare_parameter<double>("update_rate_hz", 60.0);
 
-// Tune motion here
-static const float MAX_SPEED = 800.0f;  // steps/s
-static const float ACCEL     = 400.0f;  // steps/s^2
+    // Flip tendon directions together if motors wind opposite of expectation
+    invert_steps_123_ = declare_parameter<bool>("invert_steps_123", false);
 
-// Optional: stop motors + disable drivers on comms timeout
-static const bool DISABLE_ON_TIMEOUT = false;
+    // ---------------- Home + slack clamp (Choice 2) ----------------
+    // Home is the baseline "tight neutral". With your Arduino sketch, currentPosition()
+    // is set to 0 on boot, so default home=0 is usually correct.
+    t1_home_steps_ = declare_parameter<long>("t1_home_steps", 0);
+    t2_home_steps_ = declare_parameter<long>("t2_home_steps", 0);
+    t3_home_steps_ = declare_parameter<long>("t3_home_steps", 0);
 
-// ===================== Command handling =====================
-void handle_line(const char* line_in) {
-  // Trim leading spaces
-  while (*line_in == ' ' || *line_in == '\t') ++line_in;
-  if (*line_in == '\0') return;
+    // Allow small unwind below home to avoid fighting geometry, but keep tension.
+    slack_allowance_steps_ = declare_parameter<long>("slack_allowance_steps", 200);
 
-  // Enable/disable commands (optional)
-  if (strcmp(line_in, "EN 1") == 0) {
-    set_enable(true);
-    drivers_enabled = true;
-    Serial.println("ENABLED");
-    return;
-  }
-  if (strcmp(line_in, "EN 0") == 0) {
-    set_enable(false);
-    drivers_enabled = false;
-    Serial.println("DISABLED");
-    return;
-  }
+    // Per-motor max clamp (VERY useful to avoid over-tension / missed steps)
+    clamp_max_enabled_ = declare_parameter<bool>("clamp_max_enabled", true);
+    t1_max_steps_ = declare_parameter<long>("t1_max_steps", 20000);
+    t2_max_steps_ = declare_parameter<long>("t2_max_steps", 20000);
+    t3_max_steps_ = declare_parameter<long>("t3_max_steps", 20000);
 
-  // Main command: P t1 t2 t3 t4
-  long t1, t2, t3, t4;
-  if (sscanf(line_in, "P %ld %ld %ld %ld", &t1, &t2, &t3, &t4) == 4) {
-    // First valid command: enable drivers (prevents boot drift)
-    if (!drivers_enabled) {
-      set_enable(true);
-      drivers_enabled = true;
-      Serial.println("AUTO-EN");
+    // Compute per-motor mins
+    t1_min_steps_ = t1_home_steps_ - slack_allowance_steps_;
+    t2_min_steps_ = t2_home_steps_ - slack_allowance_steps_;
+    t3_min_steps_ = t3_home_steps_ - slack_allowance_steps_;
+
+    // Start holding at home
+    t1_ = t1_home_steps_;
+    t2_ = t2_home_steps_;
+    t3_ = t3_home_steps_;
+
+    // ---------------- Stepper4 (your existing behavior) ----------------
+    btn_step4_neg_ = declare_parameter<int>("btn_step4_neg", 4); // LB
+    btn_step4_pos_ = declare_parameter<int>("btn_step4_pos", 5); // RB
+    step4_steps_per_tick_ = declare_parameter<double>("step4_steps_per_tick", 1.0);
+
+    step4_home_steps_       = declare_parameter<long>("step4_home_steps", 0);
+    step4_max_travel_steps_ = declare_parameter<long>("step4_max_travel_steps", 4000);
+    step4_steps_     = step4_home_steps_;
+    step4_min_steps_ = step4_home_steps_ - step4_max_travel_steps_;
+    step4_max_steps_ = step4_home_steps_ + step4_max_travel_steps_;
+
+    // ---------------- Serial ----------------
+    port_ = declare_parameter<std::string>("port", "/dev/ttyACM0");
+    baud_ = declare_parameter<int>("baud", 115200);
+    send_enable_cmd_ = declare_parameter<bool>("send_enable_cmd", true); // send "EN 1" on startup
+
+    fd_ = open_serial(port_.c_str(), baud_);
+    if (fd_ < 0) {
+      RCLCPP_FATAL(get_logger(), "Failed to open serial port: %s", port_.c_str());
+      throw std::runtime_error("Failed to open serial port");
     }
 
-    last_cmd_ms = millis();
+    if (send_enable_cmd_) {
+      write_line("EN 1\n");
+    }
 
-    s1.moveTo(t1);
-    s2.moveTo(t2);
-    s3.moveTo(t3);
-    s4.moveTo(t4);
+    // Send initial hold at home so Arduino has an explicit target
+    write_targets();
 
-    // Optional debug:
-    // Serial.print("GOT: "); Serial.println(line_in);
-    return;
+    // ROS interfaces
+    sub_ = create_subscription<sensor_msgs::msg::Joy>(
+      "joy", 10, std::bind(&StepperJoy::on_joy, this, std::placeholders::_1));
+
+    timer_ = create_wall_timer(
+      std::chrono::duration<double>(1.0 / update_rate_hz_),
+      std::bind(&StepperJoy::tick, this)
+    );
+
+    RCLCPP_INFO(get_logger(),
+      "stepper_joy_node started (full)\n"
+      "  rate=%.1f Hz deadband=%.2f invert_y=%s\n"
+      "  max_steps_per_tick=%.2f (slow)\n"
+      "  home=[%ld %ld %ld] slack=%ld => mins=[%ld %ld %ld]\n"
+      "  max_clamp=%s max=[%ld %ld %ld]\n"
+      "  HOME btn=%d home_step4=%s | deadman=%s btn=%d\n"
+      "  step4: LB=%d RB=%d step=%.2f clamp=[%ld..%ld]\n"
+      "  theta_offset=%.1f invert_theta=%s invert_steps_123=%s\n"
+      "  serial: port=%s baud=%d enable_cmd=%s",
+      update_rate_hz_, deadband_, invert_y_ ? "true" : "false",
+      max_steps_per_tick_,
+      t1_home_steps_, t2_home_steps_, t3_home_steps_, slack_allowance_steps_,
+      t1_min_steps_, t2_min_steps_, t3_min_steps_,
+      clamp_max_enabled_ ? "true" : "false", t1_max_steps_, t2_max_steps_, t3_max_steps_,
+      btn_home_, home_step4_too_ ? "true" : "false",
+      use_deadman_ ? "true" : "false", btn_deadman_,
+      btn_step4_neg_, btn_step4_pos_, step4_steps_per_tick_, step4_min_steps_, step4_max_steps_,
+      theta_offset_deg_, invert_theta_ ? "true" : "false",
+      invert_steps_123_ ? "true" : "false",
+      port_.c_str(), baud_, send_enable_cmd_ ? "true" : "false");
   }
 
-  // Unknown command -> ignore silently (keeps loop fast)
-}
+  ~StepperJoy() override {
+    if (fd_ >= 0) close(fd_);
+  }
 
-// ===================== Setup =====================
-void setup() {
-  // Make STEP/DIR outputs immediately to reduce floating/noise
-  pinMode(STEP1, OUTPUT); pinMode(DIR1, OUTPUT);
-  pinMode(STEP2, OUTPUT); pinMode(DIR2, OUTPUT);
-  pinMode(STEP3, OUTPUT); pinMode(DIR3, OUTPUT);
-  pinMode(STEP4, OUTPUT); pinMode(DIR4, OUTPUT);
+private:
+  void on_joy(const sensor_msgs::msg::Joy::SharedPtr msg) { last_joy_ = msg; }
 
-  // IMPORTANT: disable drivers at boot (prevents runaways during reset)
-  pinMode(EN_PIN, OUTPUT);
-  set_enable(false);
-  drivers_enabled = false;
+  double get_axis(int idx) const {
+    if (!last_joy_) return 0.0;
+    if (idx < 0 || idx >= (int)last_joy_->axes.size()) return 0.0;
+    return last_joy_->axes[idx];
+  }
 
-  // Serial
-  Serial.begin(115200);
-  // NOTE: no readStringUntil, so timeout doesn’t matter anymore
-  Serial.setTimeout(1);
+  bool get_button(int idx) const {
+    if (!last_joy_) return false;
+    if (idx < 0 || idx >= (int)last_joy_->buttons.size()) return false;
+    return last_joy_->buttons[idx] != 0;
+  }
 
-  // Configure steppers
-  s1.setMaxSpeed(MAX_SPEED); s1.setAcceleration(ACCEL);
-  s2.setMaxSpeed(MAX_SPEED); s2.setAcceleration(ACCEL);
-  s3.setMaxSpeed(MAX_SPEED); s3.setAcceleration(ACCEL);
-  s4.setMaxSpeed(MAX_SPEED); s4.setAcceleration(ACCEL);
+  static double apply_deadband(double v, double db) {
+    return (std::abs(v) < db) ? 0.0 : v;
+  }
 
-  s1.setCurrentPosition(0);
-  s2.setCurrentPosition(0);
-  s3.setCurrentPosition(0);
-  s4.setCurrentPosition(0);
+  long clamp_steps(long v, long lo, long hi) const {
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
+  }
 
-  last_cmd_ms = millis();
+  long clamp123(long v, int idx) const {
+    long lo = 0, hi = 0;
+    if (idx == 1) { lo = t1_min_steps_; hi = t1_max_steps_; }
+    if (idx == 2) { lo = t2_min_steps_; hi = t2_max_steps_; }
+    if (idx == 3) { lo = t3_min_steps_; hi = t3_max_steps_; }
 
-  Serial.println("READY (drivers disabled until first P...)");
-}
+    if (!clamp_max_enabled_) return std::max(v, lo);
+    return clamp_steps(v, lo, hi);
+  }
 
-// ===================== Loop =====================
-void loop() {
-  // ---- 1) Read all available serial bytes (non-blocking) ----
-  while (Serial.available() > 0) {
-    int c = Serial.read();
-    if (c < 0) break;
+  void write_targets() {
+    char buf[160];
+    std::snprintf(buf, sizeof(buf), "P %ld %ld %ld %ld\n", t1_, t2_, t3_, step4_steps_);
+    write_line(buf);
+  }
 
-    if (c == '\r') continue;
+  void tick() {
+    if (!last_joy_) return;
 
-    if (c == '\n') {
-      // End of line
-      if (cmd_len > 0) {
-        cmd_buf[cmd_len] = '\0';
-        handle_line(cmd_buf);
-        cmd_len = 0;
-      }
-    } else {
-      // Accumulate
-      if (cmd_len < CMD_BUF_SZ - 1) {
-        cmd_buf[cmd_len++] = (char)c;
-      } else {
-        // Overflow -> reset buffer (avoid stuck state)
-        cmd_len = 0;
-      }
+    // Deadman: if enabled and not held, do nothing (holds last targets)
+    if (use_deadman_ && !get_button(btn_deadman_)) {
+      return;
+    }
+
+    // HOME: return to neutral baseline
+    const bool go_home = get_button(btn_home_);
+    if (go_home) {
+      t1_ = t1_home_steps_;
+      t2_ = t2_home_steps_;
+      t3_ = t3_home_steps_;
+      if (home_step4_too_) step4_steps_ = step4_home_steps_;
+      // still allow stepper4 buttons after? We'll just home then proceed; user can also set home_step4_too_=false
+    }
+
+    // ---- joystick -> direction + speed ----
+    double x = apply_deadband(get_axis(axis_x_), deadband_);
+    double y = apply_deadband(get_axis(axis_y_), deadband_);
+    if (invert_y_) y = -y;
+
+    const double mag = std::sqrt(x*x + y*y);
+    const double b = std::clamp(mag, 0.0, 1.0);
+
+    double theta = 0.0;
+    double theta_deg = 0.0;
+    if (b > 0.0) {
+      theta = std::atan2(y, x);
+      theta_deg = theta * 180.0 / M_PI;
+      theta_deg += theta_offset_deg_;
+      if (invert_theta_) theta_deg = -theta_deg;
+      theta = theta_deg * M_PI / 180.0;
+    }
+
+    // Tendon angles
+    const double phi1 = 0.0;
+    const double phi2 = 2.0 * M_PI / 3.0;
+    const double phi3 = 4.0 * M_PI / 3.0;
+
+    // ---- incremental update ----
+    // base step increment at full stick
+    const double base = max_steps_per_tick_ * b;
+
+    long dt1 = 0, dt2 = 0, dt3 = 0;
+    if (!go_home && base > 0.0) { // if you're holding HOME, we don't also apply joystick increments
+      dt1 = (long)std::lround(base * std::cos(theta - phi1));
+      dt2 = (long)std::lround(base * std::cos(theta - phi2));
+      dt3 = (long)std::lround(base * std::cos(theta - phi3));
+      if (invert_steps_123_) { dt1 = -dt1; dt2 = -dt2; dt3 = -dt3; }
+
+      t1_ = clamp123(t1_ + dt1, 1);
+      t2_ = clamp123(t2_ + dt2, 2);
+      t3_ = clamp123(t3_ + dt3, 3);
+    }
+
+    // ---- Stepper4 buttons ----
+    // (If you want HOME to override stepper4 too, set home_step4_too_=true)
+    const bool pos = get_button(btn_step4_pos_);
+    const bool neg = get_button(btn_step4_neg_);
+    long delta4 = 0;
+    if (pos && !neg) delta4 =  (long)std::lround(step4_steps_per_tick_);
+    if (neg && !pos) delta4 = -(long)std::lround(step4_steps_per_tick_);
+    if (delta4 != 0) {
+      step4_steps_ = clamp_steps(step4_steps_ + delta4, step4_min_steps_, step4_max_steps_);
+    }
+
+    // ---- send if changed ----
+    if (t1_ == last_sent_t1_ && t2_ == last_sent_t2_ && t3_ == last_sent_t3_ && step4_steps_ == last_sent_t4_) {
+      return;
+    }
+
+    last_sent_t1_ = t1_;
+    last_sent_t2_ = t2_;
+    last_sent_t3_ = t3_;
+    last_sent_t4_ = step4_steps_;
+
+    write_targets();
+
+    RCLCPP_INFO_THROTTLE(
+      get_logger(), *get_clock(), 500,
+      "b=%.2f theta=%.1fdeg | dsteps [%ld %ld %ld] | tgt [%ld %ld %ld] | mins [%ld %ld %ld] | max [%ld %ld %ld] | home=%d",
+      b, theta_deg, dt1, dt2, dt3,
+      t1_, t2_, t3_,
+      t1_min_steps_, t2_min_steps_, t3_min_steps_,
+      t1_max_steps_, t2_max_steps_, t3_max_steps_,
+      (int)go_home);
+  }
+
+  // ---------- serial helpers ----------
+  static speed_t baud_to_flag(int baud) {
+    switch (baud) {
+      case 9600: return B9600;
+      case 57600: return B57600;
+      case 115200: return B115200;
+      default: return B115200;
     }
   }
 
-  // ---- 2) Watchdog: if comms stop, stop motion ----
-  if (drivers_enabled && (millis() - last_cmd_ms > CMD_TIMEOUT_MS)) {
-    // stop() decelerates; you can also force immediate by moveTo(currentPosition)
-    s1.stop(); s2.stop(); s3.stop(); s4.stop();
-
-    // Optionally hard-freeze positions immediately:
-    // s1.moveTo(s1.currentPosition());
-    // s2.moveTo(s2.currentPosition());
-    // s3.moveTo(s3.currentPosition());
-    // s4.moveTo(s4.currentPosition());
-
-    if (DISABLE_ON_TIMEOUT) {
-      set_enable(false);
-      drivers_enabled = false;
-      Serial.println("TIMEOUT -> DISABLE");
-    } else {
-      // Keep enabled but stopped; update last_cmd_ms so we don't spam stops
-      last_cmd_ms = millis();
-      // Serial.println("TIMEOUT -> STOP");
+  int open_serial(const char* dev, int baud) {
+    int fd = ::open(dev, O_RDWR | O_NOCTTY | O_SYNC);
+    if (fd < 0) {
+      RCLCPP_ERROR(get_logger(), "open(%s) failed: %s", dev, std::strerror(errno));
+      return -1;
     }
+
+    termios tty{};
+    if (tcgetattr(fd, &tty) != 0) {
+      RCLCPP_ERROR(get_logger(), "tcgetattr(%s) failed: %s", dev, std::strerror(errno));
+      ::close(fd);
+      return -1;
+    }
+
+    cfmakeraw(&tty);
+
+    speed_t spd = baud_to_flag(baud);
+    if (cfsetispeed(&tty, spd) != 0 || cfsetospeed(&tty, spd) != 0) {
+      RCLCPP_ERROR(get_logger(), "cfsetispeed/cfsetospeed failed: %s", std::strerror(errno));
+      ::close(fd);
+      return -1;
+    }
+
+    tty.c_cflag = (tty.c_cflag & ~CSIZE) | CS8;
+    tty.c_cflag |= (CLOCAL | CREAD);
+    tty.c_cflag &= ~(PARENB | PARODD);
+    tty.c_cflag &= ~CSTOPB;
+    tty.c_cflag &= ~CRTSCTS;
+
+    tty.c_cc[VMIN]  = 0;
+    tty.c_cc[VTIME] = 1;
+
+    if (tcsetattr(fd, TCSANOW, &tty) != 0) {
+      RCLCPP_ERROR(get_logger(), "tcsetattr(%s) failed: %s", dev, std::strerror(errno));
+      ::close(fd);
+      return -1;
+    }
+
+    tcflush(fd, TCIOFLUSH);
+    return fd;
   }
 
-  // ---- 3) Step motors ----
-  s1.run();
-  s2.run();
-  s3.run();
-  s4.run();
+  void write_line(const std::string& s) {
+    if (fd_ < 0) return;
+    ::write(fd_, s.c_str(), s.size());
+  }
+
+  // ---------- members ----------
+  rclcpp::Subscription<sensor_msgs::msg::Joy>::SharedPtr sub_;
+  rclcpp::TimerBase::SharedPtr timer_;
+  sensor_msgs::msg::Joy::SharedPtr last_joy_;
+
+  // joystick
+  int axis_x_{0}, axis_y_{1};
+  double deadband_{0.20};
+  bool invert_y_{true};
+
+  // direction alignment
+  double theta_offset_deg_{0.0};
+  bool invert_theta_{false};
+
+  // buttons
+  int btn_home_{3};
+  bool home_step4_too_{false};
+
+  bool use_deadman_{false};
+  int  btn_deadman_{0};
+
+  // speed
+  double max_steps_per_tick_{1.0};
+  double update_rate_hz_{60.0};
+
+  // clamp + home
+  bool invert_steps_123_{false};
+
+  long t1_home_steps_{0}, t2_home_steps_{0}, t3_home_steps_{0};
+  long slack_allowance_steps_{200};
+  long t1_min_steps_{-200}, t2_min_steps_{-200}, t3_min_steps_{-200};
+
+  bool clamp_max_enabled_{true};
+  long t1_max_steps_{20000}, t2_max_steps_{20000}, t3_max_steps_{20000};
+
+  // persistent targets
+  long t1_{0}, t2_{0}, t3_{0};
+
+  // stepper4
+  int btn_step4_neg_{4}, btn_step4_pos_{5};
+  double step4_steps_per_tick_{1.0};
+  long step4_steps_{0};
+  long step4_home_steps_{0};
+  long step4_max_travel_steps_{4000};
+  long step4_min_steps_{0};
+  long step4_max_steps_{0};
+
+  // last sent
+  long last_sent_t1_{std::numeric_limits<long>::min()};
+  long last_sent_t2_{std::numeric_limits<long>::min()};
+  long last_sent_t3_{std::numeric_limits<long>::min()};
+  long last_sent_t4_{std::numeric_limits<long>::min()};
+
+  // serial
+  std::string port_{"/dev/ttyACM0"};
+  int baud_{115200};
+  bool send_enable_cmd_{true};
+  int fd_{-1};
+};
+
+int main(int argc, char** argv) {
+  rclcpp::init(argc, argv);
+  rclcpp::spin(std::make_shared<StepperJoy>());
+  rclcpp::shutdown();
+  return 0;
 }
