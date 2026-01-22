@@ -1,5 +1,6 @@
 #include <Servo.h>
 #include <string.h>
+#include <stdio.h>
 
 // ===== Pins (UNO) =====
 static const uint8_t SERVO1_PIN = 3;   // Pouch1
@@ -8,6 +9,7 @@ static const uint8_t SERVO3_PIN = 6;   // Pouch3
 static const uint8_t SERVO4_PIN = 9;   // Pouch4
 static const uint8_t SERVO5_PIN = 10;  // Propulsion
 static const uint8_t SERVO6_PIN = 11;  // Gripper
+static const uint8_t SERVO7_PIN = 7;   // NEW (non-PWM pin) Hold-button servo
 
 // ===== Pulse window (µs) =====
 static int US_MIN = 600;
@@ -31,14 +33,14 @@ int stepTowardBy(int current, int target, int step) {
 }
 
 // Servos
-Servo s1, s2, s3, s4, s5, s6;
+Servo s1, s2, s3, s4, s5, s6, s7;
 
 // Current + target
-int pos1=150, pos2=150, pos3=150, pos4=150, pos5=150, pos6=150;
-int tgt1=150, tgt2=150, tgt3=150, tgt4=150, tgt5=150, tgt6=150;
+int pos1=150, pos2=150, pos3=150, pos4=150, pos5=150, pos6=150, pos7=150;
+int tgt1=150, tgt2=150, tgt3=150, tgt4=150, tgt5=150, tgt6=150, tgt7=150;
 
 // Non-blocking serial line parser
-static const size_t CMD_BUF_SZ = 96;
+static const size_t CMD_BUF_SZ = 128;
 char cmd_buf[CMD_BUF_SZ];
 size_t cmd_len = 0;
 
@@ -59,16 +61,22 @@ void processLine(const char* line) {
   memcpy(s, line, L);
   s[L] = '\0';
 
-  // SET:a1,a2,a3,a4,a5,a6  (angles 0..270)
+  // SET:a1,a2,a3,a4,a5,a6[,a7]  (angles 0..270)
+  // Backward compatible: accepts either 6 or 7 ints.
   if (strncmp(s, "SET:", 4) == 0) {
-    int a1,a2,a3,a4,a5,a6;
-    if (sscanf(s+4, "%d,%d,%d,%d,%d,%d", &a1,&a2,&a3,&a4,&a5,&a6) == 6) {
+    int a1,a2,a3,a4,a5,a6,a7;
+    int n = sscanf(s+4, "%d,%d,%d,%d,%d,%d,%d", &a1,&a2,&a3,&a4,&a5,&a6,&a7);
+
+    if (n >= 6) {
       tgt1 = clampi(a1, 0, 270);
       tgt2 = clampi(a2, 0, 270);
       tgt3 = clampi(a3, 0, 270);
       tgt4 = clampi(a4, 0, 270);
       tgt5 = clampi(a5, 0, 270);
       tgt6 = clampi(a6, 0, 270);
+      if (n == 7) {
+        tgt7 = clampi(a7, 0, 270);
+      }
     }
     return;
   }
@@ -84,6 +92,7 @@ void processLine(const char* line) {
         case 4: tgt4 = pos4; break;
         case 5: tgt5 = pos5; break;
         case 6: tgt6 = pos6; break;
+        case 7: tgt7 = pos7; break;
         default: break;
       }
     }
@@ -111,14 +120,16 @@ void setup() {
   s4.attach(SERVO4_PIN, US_MIN, US_MAX);
   s5.attach(SERVO5_PIN, US_MIN, US_MAX);
   s6.attach(SERVO6_PIN, US_MIN, US_MAX);
+  s7.attach(SERVO7_PIN, US_MIN, US_MAX);  // NEW
 
   writeNow(s1, pos1); writeNow(s2, pos2); writeNow(s3, pos3);
   writeNow(s4, pos4); writeNow(s5, pos5); writeNow(s6, pos6);
+  writeNow(s7, pos7);
 
-  Serial.println("Servo6 READY");
+  Serial.println("Servo7 READY");
   Serial.println("Commands:");
-  Serial.println("  SET:a1,a2,a3,a4,a5,a6");
-  Serial.println("  HALT:n (1..6)  | SPD:step,interval_ms");
+  Serial.println("  SET:a1,a2,a3,a4,a5,a6[,a7]");
+  Serial.println("  HALT:n (1..7)  | SPD:step,interval_ms");
 }
 
 void loop() {
@@ -150,6 +161,7 @@ void loop() {
     int n4 = stepTowardBy(pos4, tgt4, STEP_DEG);
     int n5 = stepTowardBy(pos5, tgt5, STEP_DEG);
     int n6 = stepTowardBy(pos6, tgt6, STEP_DEG);
+    int n7 = stepTowardBy(pos7, tgt7, STEP_DEG);
 
     if (n1 != pos1) { pos1 = n1; writeNow(s1, pos1); }
     if (n2 != pos2) { pos2 = n2; writeNow(s2, pos2); }
@@ -157,5 +169,6 @@ void loop() {
     if (n4 != pos4) { pos4 = n4; writeNow(s4, pos4); }
     if (n5 != pos5) { pos5 = n5; writeNow(s5, pos5); }
     if (n6 != pos6) { pos6 = n6; writeNow(s6, pos6); }
+    if (n7 != pos7) { pos7 = n7; writeNow(s7, pos7); }
   }
 }
