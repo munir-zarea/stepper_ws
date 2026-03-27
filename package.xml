@@ -3,7 +3,7 @@
   <name>stepper_joy</name>
   <version>0.0.1</version>
   <description>ROS2 package for joy stepper motor control. Used for robotic jellyfish arm.</description>
-  <maintainer email="zaream@hawaii.edu">Munir Zarea</maintainer>
+  <maintainer email="munzarea@gmail.com">Munir Zarea</maintainer>
   <license>Apache-2.0</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
