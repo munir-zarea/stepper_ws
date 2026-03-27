@@ -17,74 +17,74 @@
 class StepperJoy : public rclcpp::Node {
 public:
   StepperJoy() : Node("stepper_joy_node") {
-    // ---------------- Joystick ----------------
-    axis_x_   = declare_parameter<int>("axis_x", 0);   // left stick X -> single stepper jog (1/2/3)
-    axis_y_   = declare_parameter<int>("axis_y", 1);   // unused (kept)
+    //  Joystick 
+    axis_x_   = declare_parameter<int>("axis_x", 0);
     deadband_ = declare_parameter<double>("deadband", 0.20);
-    invert_y_ = declare_parameter<bool>("invert_y", true);
     invert_x_ = declare_parameter<bool>("invert_x", false);
 
-    // Kept (not used for continuum anymore, but kept so launch files don't break)
-    alpha_deg_per_tick_ = declare_parameter<double>("alpha_deg_per_tick", 0.3);
-    theta_deg_per_tick_ = declare_parameter<double>("theta_deg_per_tick", 0.3);
-
-    alpha_min_deg_ = declare_parameter<double>("alpha_min_deg", 0.0);
-    alpha_max_deg_ = declare_parameter<double>("alpha_max_deg", 260.0);
-
-    theta_offset_deg_ = declare_parameter<double>("theta_offset_deg", 0.0);
-    invert_theta_     = declare_parameter<bool>("invert_theta", false);
-
     // Buttons
-    btn_home_       = declare_parameter<int>("btn_home", 3);  // Y
-    home_step4_too_ = declare_parameter<bool>("home_step4_too", false);
-
+    btn_home_    = declare_parameter<int>("btn_home", 3);   // Y
     use_deadman_ = declare_parameter<bool>("use_deadman", false);
     btn_deadman_ = declare_parameter<int>("btn_deadman", 0); // A
 
-    // ---------------- Update rate ----------------
-    update_rate_hz_ = declare_parameter<double>("update_rate_hz", 60.0);
+    //  Update rate 
+    update_rate_hz_ = declare_parameter<double>("update_rate_hz", 100.0);
 
-    // ---------------- Stepper4 (RB/LB manual control) ----------------
-    btn_step4_neg_ = declare_parameter<int>("btn_step4_neg", 4); // LB
-    btn_step4_pos_ = declare_parameter<int>("btn_step4_pos", 5); // RB
-    step4_steps_per_tick_ = declare_parameter<double>("step4_steps_per_tick", 1.0);
+    //  Active stepper (1..3) 
+    joy_stepper_id_     = declare_parameter<int>("joy_stepper_id", 2); // you want 2
+    joy_steps_per_tick_ = declare_parameter<long>("joy_steps_per_tick", 5);
 
-    step4_home_steps_       = declare_parameter<long>("step4_home_steps", 0);
-    step4_max_travel_steps_ = declare_parameter<long>("step4_max_travel_steps", 4000);
-    step4_steps_     = step4_home_steps_;
-    step4_min_steps_ = step4_home_steps_ - step4_max_travel_steps_;
-    step4_max_steps_ = step4_home_steps_ + step4_max_travel_steps_;
-
-    // ---------------- single-stepper (1/2/3) command state ----------------
-    joy_stepper_id_ = declare_parameter<int>("joy_stepper_id", 1); // 1..3
-    joy_steps_per_tick_ = declare_parameter<long>("joy_steps_per_tick", 10);
-
-    // Slack relief: other two steppers move opposite direction by a fraction of main delta
-    slack_fraction_  = declare_parameter<double>("slack_fraction", 0.10); // 10% relief
-    slack_min_steps_ = declare_parameter<long>("slack_min_steps", 1);     // at least 1 step when moving
-
-    // Starting targets for s1/s2/s3 (steps)
+    // Start/home (1..3)
     t1_ = declare_parameter<long>("t1_start_steps", 0);
     t2_ = declare_parameter<long>("t2_start_steps", 0);
     t3_ = declare_parameter<long>("t3_start_steps", 0);
 
-    // HOME targets for s1/s2/s3 (steps)
-    t1_home_ = declare_parameter<long>("t1_home_steps", 0);
-    t2_home_ = declare_parameter<long>("t2_home_steps", 0);
-    t3_home_ = declare_parameter<long>("t3_home_steps", 0);
+    t1_home_ = declare_parameter<long>("t1_home_steps", t1_);
+    t2_home_ = declare_parameter<long>("t2_home_steps", t2_);
+    t3_home_ = declare_parameter<long>("t3_home_steps", t3_);
 
-    // ---------------- Serial ----------------
+    // Origin for extra-slack threshold (default start)
+    t2_origin_ = declare_parameter<long>("t2_origin_steps", t2_);
+
+    //  Slack behavior on other two steppers 
+    slack_fraction_base_  = declare_parameter<double>("slack_fraction_base", 0.05);
+    slack_min_steps_base_ = declare_parameter<long>("slack_min_steps_base", 0);
+
+    slack_extra_enable_ = declare_parameter<bool>("slack_extra_enable", true);
+    slack_extra_threshold_steps_ = declare_parameter<long>("slack_extra_threshold_steps", 200);
+    slack_fraction_extra_  = declare_parameter<double>("slack_fraction_extra", 0.10);
+    slack_min_steps_extra_ = declare_parameter<long>("slack_min_steps_extra", 2);
+    slack_extra_cap_steps_ = declare_parameter<long>("slack_extra_cap_steps", 50);
+
+    //  Stepper4 (RB/LB) 
+    send_step4_ = declare_parameter<bool>("send_step4", true);
+
+    btn_step4_neg_ = declare_parameter<int>("btn_step4_neg", 4); // LB
+    btn_step4_pos_ = declare_parameter<int>("btn_step4_pos", 5); // RB
+    step4_steps_per_tick_ = declare_parameter<double>("step4_steps_per_tick", 5.0);
+
+    step4_home_steps_       = declare_parameter<long>("step4_home_steps", 0);
+    step4_max_travel_steps_ = declare_parameter<long>("step4_max_travel_steps", 2000);
+
+    step4_steps_     = step4_home_steps_;
+    step4_min_steps_ = step4_home_steps_ - step4_max_travel_steps_;
+    step4_max_steps_ = step4_home_steps_ + step4_max_travel_steps_;
+
+    // If true, HOME also homes stepper4
+    home_step4_too_ = declare_parameter<bool>("home_step4_too", false);
+
+    //  Serial 
     port_ = declare_parameter<std::string>("port", "/dev/ttyACM0");
     baud_ = declare_parameter<int>("baud", 115200);
 
     send_enable_cmd_ = declare_parameter<bool>("send_enable_cmd", false);
     enable_cmd_      = declare_parameter<std::string>("enable_cmd", "EN 1\n");
 
-    // Use P for steppers 1-3 (include t4 so P doesn't disturb stepper4)
+    // P includes t4
     cmd_p_format_     = declare_parameter<std::string>("cmd_p_format", "P %ld %ld %ld %ld\n");
 
-    // Keep step4 Z command for RB/LB (unchanged)
-    send_step4_       = declare_parameter<bool>("send_step4", true);
+    // Optional Z for stepper4
+    send_step4_z_     = declare_parameter<bool>("send_step4_z", true);
     cmd_step4_format_ = declare_parameter<std::string>("cmd_step4_format", "Z %ld\n");
 
     fd_ = open_serial(port_.c_str(), baud_);
@@ -92,12 +92,10 @@ public:
       RCLCPP_FATAL(get_logger(), "Failed to open serial port: %s", port_.c_str());
       throw std::runtime_error("Failed to open serial port");
     }
-
     if (send_enable_cmd_) write_line(enable_cmd_);
 
-    // Send initial state
     send_p_if_changed(true);
-    if (send_step4_) send_step4_if_changed(true);
+    if (send_step4_ && send_step4_z_) send_step4_if_changed(true);
 
     sub_ = create_subscription<sensor_msgs::msg::Joy>(
       "joy", 10, std::bind(&StepperJoy::on_joy, this, std::placeholders::_1));
@@ -108,21 +106,18 @@ public:
     );
 
     RCLCPP_INFO(get_logger(),
-      "stepper_joy_node started (Arduino legacy P + Z)\n"
-      "  Joystick X -> jog stepper %d (among 1..3) by %ld steps/tick\n"
-      "  Slack relief: other two move opposite by %.2f (min %ld step)\n"
-      "  RB/LB unchanged -> step4 via Z (send_step4=%s)\n"
-      "  rate=%.1fHz deadband=%.2f invert_x=%s\n"
+      "stepper_joy_node started\n"
+      "  Active stepper=%d (1..3), steps/tick=%ld\n"
+      "  Stepper4: RB=%d (+) LB=%d (-) steps/tick=%.1f travel=±%ld (home=%ld)\n"
       "  serial: %s @ %d\n",
       joy_stepper_id_, joy_steps_per_tick_,
-      slack_fraction_, slack_min_steps_,
-      send_step4_ ? "true" : "false",
-      update_rate_hz_, deadband_, invert_x_ ? "true" : "false",
+      btn_step4_pos_, btn_step4_neg_, step4_steps_per_tick_,
+      step4_max_travel_steps_, step4_home_steps_,
       port_.c_str(), baud_);
   }
 
   ~StepperJoy() override {
-    if (fd_ >= 0) close(fd_);
+    if (fd_ >= 0) ::close(fd_);
   }
 
 private:
@@ -143,53 +138,62 @@ private:
   static long clamp_steps(long v, long lo, long hi) {
     if (v < lo) return lo;
     if (v > hi) return hi;
-    return hi == lo ? lo : v;
+    return v;
   }
 
   void tick() {
     if (!last_joy_) return;
     if (use_deadman_ && !get_button(btn_deadman_)) return;
 
-    // HOME (kept)
+    const int sid = std::clamp(joy_stepper_id_, 1, 3);
+
+    // HOME
     if (get_button(btn_home_)) {
       t1_ = t1_home_;
       t2_ = t2_home_;
       t3_ = t3_home_;
 
+      // reset origin to home (optional but usually desirable)
+      t2_origin_ = t2_home_;
+
       if (home_step4_too_) step4_steps_ = step4_home_steps_;
 
       send_p_if_changed(true);
-      if (send_step4_) send_step4_if_changed(true);
+      if (send_step4_ && send_step4_z_) send_step4_if_changed(true);
       return;
     }
 
-    // ---------- Joystick logic: ONE of (t1,t2,t3) moves while held ----------
+    // - Stepper 1..3 joystick logic -
     double x = get_axis(axis_x_);
     if (invert_x_) x = -x;
 
-    bool p_changed = false;
-
     long delta = 0;
-    if (x > deadband_) {
-      delta = joy_steps_per_tick_;
-    } else if (x < -deadband_) {
-      delta = -joy_steps_per_tick_;
-    }
+    if (x > deadband_) delta =  joy_steps_per_tick_;
+    if (x < -deadband_) delta = -joy_steps_per_tick_;
 
+    bool p_changed = false;
     if (delta != 0) {
-      const int sid = std::clamp(joy_stepper_id_, 1, 3);
-
-      // Main move
+      // main move
       if (sid == 1) t1_ += delta;
       if (sid == 2) t2_ += delta;
       if (sid == 3) t3_ += delta;
 
-      // Slack relief on the other two: move opposite direction by a small amount
-      const double k = std::clamp(slack_fraction_, 0.0, 1.0);
-      long slack = (long)std::llround(std::fabs((double)delta) * k);
-      if (slack < slack_min_steps_) slack = slack_min_steps_;
+      // baseline slack on other two
+      long base_slack = (long)std::llround(std::fabs((double)delta) * std::clamp(slack_fraction_base_, 0.0, 1.0));
+      if (base_slack < slack_min_steps_base_) base_slack = slack_min_steps_base_;
 
-      const long relief = (delta > 0) ? -slack : +slack;
+      // extra slack when moving RIGHT and t2 beyond threshold
+      long extra_slack = 0;
+      if (slack_extra_enable_ && delta > 0) {
+        const long t2_disp = t2_ - t2_origin_;
+        if (t2_disp >= slack_extra_threshold_steps_) {
+          extra_slack = (long)std::llround(std::fabs((double)delta) * std::clamp(slack_fraction_extra_, 0.0, 1.0));
+          if (extra_slack < slack_min_steps_extra_) extra_slack = slack_min_steps_extra_;
+          extra_slack = std::min(extra_slack, slack_extra_cap_steps_);
+        }
+      }
+
+      const long relief = (delta > 0) ? -(base_slack + extra_slack) : +(base_slack);
 
       if (sid == 1) { t2_ += relief; t3_ += relief; }
       if (sid == 2) { t1_ += relief; t3_ += relief; }
@@ -198,29 +202,35 @@ private:
       p_changed = true;
     }
 
-    // ---------- KEEP ORIGINAL RB/LB LOGIC FOR STEPPER 4 ----------
+    // - Stepper 4 RB/LB logic -
+    bool step4_changed = false;
     if (send_step4_) {
       const bool pos = get_button(btn_step4_pos_);
       const bool neg = get_button(btn_step4_neg_);
       long delta4 = 0;
+
       if (pos && !neg) delta4 =  (long)std::lround(step4_steps_per_tick_);
       if (neg && !pos) delta4 = -(long)std::lround(step4_steps_per_tick_);
+
       if (delta4 != 0) {
         step4_steps_ = clamp_steps(step4_steps_ + delta4, step4_min_steps_, step4_max_steps_);
+        step4_changed = true;
       }
     }
 
-    // Send serial updates only when something changes
-    if (p_changed) send_p_if_changed(false);
-    if (send_step4_) send_step4_if_changed(false);
+    if (p_changed || step4_changed) {
+      send_p_if_changed(false);
+      if (send_step4_ && send_step4_z_ && step4_changed) {
+        send_step4_if_changed(false);
+      }
+    }
 
     RCLCPP_INFO_THROTTLE(
       get_logger(), *get_clock(), 500,
-      "joy_stepper=%d x=%.2f | t1=%ld t2=%ld t3=%ld | step4=%ld | slack_k=%.2f",
-      joy_stepper_id_, x, t1_, t2_, t3_, step4_steps_, slack_fraction_);
+      "sid=%d x=%.2f | t1=%ld t2=%ld t3=%ld | t2_disp=%ld | step4=%ld",
+      sid, x, t1_, t2_, t3_, (t2_ - t2_origin_), step4_steps_);
   }
 
-  // ---------- serial send ----------
   void send_p_if_changed(bool force) {
     const long t4 = step4_steps_;
 
@@ -251,7 +261,7 @@ private:
     write_line(buf);
   }
 
-  // ---------- serial ----------
+  //  serial 
   static speed_t baud_to_flag(int baud) {
     switch (baud) {
       case 9600: return B9600;
@@ -308,60 +318,55 @@ private:
     (void)::write(fd_, s.c_str(), s.size());
   }
 
-  // ---------- members ----------
+  //  members 
   rclcpp::Subscription<sensor_msgs::msg::Joy>::SharedPtr sub_;
   rclcpp::TimerBase::SharedPtr timer_;
   sensor_msgs::msg::Joy::SharedPtr last_joy_;
 
-  // joystick
-  int axis_x_{0}, axis_y_{1};
+  int axis_x_{0};
   double deadband_{0.20};
-  bool invert_y_{true};
   bool invert_x_{false};
 
-  // kept params
-  double alpha_deg_per_tick_{0.3};
-  double theta_deg_per_tick_{0.3};
-  double alpha_min_deg_{0.0};
-  double alpha_max_deg_{260.0};
-  double theta_offset_deg_{0.0};
-  bool invert_theta_{false};
-
   int btn_home_{3};
-  bool home_step4_too_{false};
   bool use_deadman_{false};
   int btn_deadman_{0};
 
-  double update_rate_hz_{60.0};
+  double update_rate_hz_{100.0};
 
-  // stepper4
-  int btn_step4_neg_{4}, btn_step4_pos_{5};
-  double step4_steps_per_tick_{1.0};
-  long step4_steps_{0};
-  long step4_home_steps_{0};
-  long step4_max_travel_steps_{4000};
-  long step4_min_steps_{0};
-  long step4_max_steps_{0};
-
-  // steppers 1..3
-  int joy_stepper_id_{1};
-  long joy_steps_per_tick_{10};
-
-  // slack relief
-  double slack_fraction_{0.10};
-  long slack_min_steps_{1};
+  int joy_stepper_id_{2};
+  long joy_steps_per_tick_{5};
 
   long t1_{0}, t2_{0}, t3_{0};
   long t1_home_{0}, t2_home_{0}, t3_home_{0};
+  long t2_origin_{0};
 
-  // last sent
+  double slack_fraction_base_{0.05};
+  long slack_min_steps_base_{0};
+
+  bool slack_extra_enable_{true};
+  long slack_extra_threshold_steps_{200};
+  double slack_fraction_extra_{0.10};
+  long slack_min_steps_extra_{2};
+  long slack_extra_cap_steps_{50};
+
+  // stepper4
+  bool send_step4_{true};
+  bool send_step4_z_{true};
+  int btn_step4_neg_{4}, btn_step4_pos_{5};
+  double step4_steps_per_tick_{5.0};
+  long step4_steps_{0};
+  long step4_home_steps_{0};
+  long step4_max_travel_steps_{2000};
+  long step4_min_steps_{0};
+  long step4_max_steps_{0};
+  bool home_step4_too_{false};
+
   long last_sent_t1_{std::numeric_limits<long>::min()};
   long last_sent_t2_{std::numeric_limits<long>::min()};
   long last_sent_t3_{std::numeric_limits<long>::min()};
   long last_sent_t4_{std::numeric_limits<long>::min()};
   long last_sent_step4_{std::numeric_limits<long>::min()};
 
-  // serial
   std::string port_{"/dev/ttyACM0"};
   int baud_{115200};
   int fd_{-1};
@@ -370,7 +375,6 @@ private:
   std::string enable_cmd_{"EN 1\n"};
 
   std::string cmd_p_format_{"P %ld %ld %ld %ld\n"};
-  bool send_step4_{true};
   std::string cmd_step4_format_{"Z %ld\n"};
 };
 
