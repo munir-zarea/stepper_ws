@@ -14,12 +14,12 @@ add_executable(stepper_joy_node src/stepper_joy_node.cpp)
 ament_target_dependencies(stepper_joy_node rclcpp sensor_msgs)
 
 # -------- Servo serial node (name MUST match launch) --------
-add_executable(joystick_servo6_serial_node src/joystick_servo6_serial_node.cpp)
-ament_target_dependencies(joystick_servo6_serial_node rclcpp sensor_msgs)
+add_executable(joystick_servo7_serial_node src/joystick_servo7_serial_node.cpp)
+ament_target_dependencies(joystick_servo7_serial_node rclcpp sensor_msgs)
 
 install(TARGETS
   stepper_joy_node
-  joystick_servo6_serial_node
+  joystick_servo7_serial_node
   DESTINATION lib/${PROJECT_NAME}
 )
 
