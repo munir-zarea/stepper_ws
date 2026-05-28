@@ -19,7 +19,7 @@ def generate_launch_description():
             description='Stable /dev/serial/by-id path for the servo Arduino'
         ),
 
-        # ====== Joy node ======
+        # Joy node
         Node(
             package='joy',
             executable='joy_node',
@@ -31,7 +31,7 @@ def generate_launch_description():
             }]
         ),
 
-        # ====== Steppers (Arduino #1) ======
+        # Steppers (Arduino #1)
         Node(
             package='stepper_joy',
             executable='stepper_joy_node',
@@ -69,7 +69,7 @@ def generate_launch_description():
 
                 'update_rate_hz': 100.0,
 
-                # ===== NEW: Use Arduino legacy P command to move ONLY one of s1/s2/s3 =====
+                # NEW: Use Arduino legacy P command to move ONLY one of s1/s2/s3
                 # Arduino expects: P t1 t2 t3 t4\n  (targets in steps)
                 'cmd_p_format': "P %ld %ld %ld %ld\n",
 
@@ -85,7 +85,7 @@ def generate_launch_description():
                 't2_home_steps': 0,
                 't3_home_steps': 0,
 
-                # ===== Stepper4 stays RB/LB via Z (UNCHANGED) =====
+                # Stepper4 stays RB/LB via Z (UNCHANGED)
                 'send_step4': True,
                 'cmd_step4_format': "Z %ld\n",
                 'btn_step4_pos': 5,          # RB
@@ -104,7 +104,7 @@ def generate_launch_description():
             }]
         ),
 
-        # ====== Servos (Arduino #2) ======
+        # Servos (Arduino #2)
         Node(
             package='stepper_joy',
             executable='joystick_servo6_serial_node',
