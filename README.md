@@ -7,12 +7,12 @@ ROS 2 workspace for joystick-driven control of a soft underwater robotic manipul
 ## Repository Structure
 
 stepper_ws/
-├── src/
-│   └── stepper_joy/
-│       ├── stepper_joy_node.cpp                 # Stepper motor controller (Arduino #1)
-│       ├── joystick_servo7_serial_node.cpp      # Servo controller (Arduino #2)
-│       └── launch/
-│           └── stepper_joy.launch.py            # Combined launch file
+    src/
+        stepper_joy/
+            stepper_joy_node.cpp
+            joystick_servo7_serial_node.cpp
+            launch/
+                stepper_joy.launch.py
 
 ---
 
